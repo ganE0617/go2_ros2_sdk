@@ -1,315 +1,300 @@
 // Copyright (c) 2024, RoboVerse community
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "lidar_processor_cpp/lidar_to_pointcloud_node.hpp"
-#include <algorithm>
+/*
+LiDAR to PointCloud Node (C++)
+
+Rewritten from Python version without Open3D.
+Aggregates incoming PointCloud2 data, publishes aggregated cloud, and
+optionally saves to ASCII PLY periodically with simple voxel downsampling.
+*/
+
 #include <chrono>
+#include <cmath>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include <fstream>
+#include <algorithm>
+#include <deque>
 
-namespace lidar_processor_cpp
-{
+// PCL
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/io/ply_io.h>
+#include <pcl_conversions/pcl_conversions.h>
 
-PointCloudAggregator::PointCloudAggregator(const LidarConfig& config)
-  : config_(config), points_changed_(false)
-{
-}
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp/qos.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 
-void PointCloudAggregator::addPoints(const std::vector<Point3D>& new_points)
-{
-  std::lock_guard<std::mutex> lock(points_mutex_);
-  
-  for (const auto& point : new_points) {
-    // Round points to reduce memory usage
-    Point3D rounded_point(
-      std::round(point.x * 1000.0f) / 1000.0f,
-      std::round(point.y * 1000.0f) / 1000.0f,
-      std::round(point.z * 1000.0f) / 1000.0f
-    );
-    points_.insert(rounded_point);
+using sensor_msgs::msg::PointCloud2;
+using namespace std::chrono_literals;
+
+struct RoundedPointHash {
+  std::size_t operator()(const std::tuple<float, float, float> &p) const noexcept {
+    const auto &x = std::get<0>(p);
+    const auto &y = std::get<1>(p);
+    const auto &z = std::get<2>(p);
+    // Simple hash combine
+    std::size_t hx = std::hash<float>{}(x);
+    std::size_t hy = std::hash<float>{}(y);
+    std::size_t hz = std::hash<float>{}(z);
+    return hx ^ (hy << 1) ^ (hz << 2);
   }
-  
-  // Memory management - remove oldest points if exceeding limit
-  if (static_cast<int>(points_.size()) > config_.max_points) {
-    std::vector<Point3D> points_vector(points_.begin(), points_.end());
-    
-    // Sort by distance from origin, keep closest points
-    std::sort(points_vector.begin(), points_vector.end(),
-      [](const Point3D& a, const Point3D& b) {
-        float dist_a = a.x * a.x + a.y * a.y + a.z * a.z;
-        float dist_b = b.x * b.x + b.y * b.y + b.z * b.z;
-        return dist_a < dist_b;
-      });
-    
-    points_.clear();
-    for (int i = 0; i < config_.max_points && i < static_cast<int>(points_vector.size()); ++i) {
-      points_.insert(points_vector[i]);
-    }
-  }
-  
-  points_changed_ = true;
-}
+};
 
-std::vector<Point3D> PointCloudAggregator::getPointsCopy() const
-{
-  std::lock_guard<std::mutex> lock(points_mutex_);
-  return std::vector<Point3D>(points_.begin(), points_.end());
-}
+class PointCloudAggregator {
+public:
+  explicit PointCloudAggregator(std::size_t max_points)
+  : max_points_(max_points) {}
 
-bool PointCloudAggregator::hasChanges() const
-{
-  return points_changed_.load();
-}
-
-void PointCloudAggregator::markSaved()
-{
-  points_changed_ = false;
-}
-
-int PointCloudAggregator::getPointCount() const
-{
-  std::lock_guard<std::mutex> lock(points_mutex_);
-  return static_cast<int>(points_.size());
-}
-
-LidarToPointCloudNode::LidarToPointCloudNode()
-  : Node("lidar_to_pointcloud")
-{
-  // Declare and get parameters
-  declareParameters();
-  config_ = loadConfiguration();
-  
-  // Initialize components
-  aggregator_ = std::make_unique<PointCloudAggregator>(config_);
-  
-  // Setup subscriptions and publishers
-  setupSubscriptions();
-  setupPublishers();
-  
-  // Setup timers
-  if (config_.save_map) {
-    save_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(config_.save_interval),
-      std::bind(&LidarToPointCloudNode::saveMapCallback, this)
-    );
-  }
-  
-  // Log configuration
-  logConfiguration();
-}
-
-void LidarToPointCloudNode::declareParameters()
-{
-  this->declare_parameter("robot_ip_lst", std::vector<std::string>{});
-  this->declare_parameter("map_name", "3d_map");
-  this->declare_parameter("map_save", "true");
-  this->declare_parameter("save_interval", 10.0);
-  this->declare_parameter("max_points", 1000000);
-  this->declare_parameter("voxel_size", 0.01);
-}
-
-LidarConfig LidarToPointCloudNode::loadConfiguration()
-{
-  LidarConfig config;
-  
-  config.robot_ip_list = this->get_parameter("robot_ip_lst").as_string_array();
-  config.map_name = this->get_parameter("map_name").as_string();
-  std::string save_map_str = this->get_parameter("map_save").as_string();
-  config.save_map = (save_map_str == "true");
-  config.save_interval = this->get_parameter("save_interval").as_double();
-  config.max_points = this->get_parameter("max_points").as_int();
-  config.voxel_size = this->get_parameter("voxel_size").as_double();
-  
-  return config;
-}
-
-void LidarToPointCloudNode::setupSubscriptions()
-{
-  // Setup QoS profile for high-frequency data
-  auto qos = rclcpp::QoS(1)
-    .reliability(rclcpp::ReliabilityPolicy::BestEffort)
-    .history(rclcpp::HistoryPolicy::KeepLast);
-  
-  if (config_.robot_ip_list.size() == 1) {
-    // Single robot mode
-    auto subscription = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/robot0/point_cloud2",
-      qos,
-      std::bind(&LidarToPointCloudNode::lidarCallback, this, std::placeholders::_1)
-    );
-    subscriptions_.push_back(subscription);
-  } else {
-    // Multi-robot mode
-    for (size_t i = 0; i < config_.robot_ip_list.size(); ++i) {
-      std::string topic = "/robot" + std::to_string(i) + "/point_cloud2";
-      auto subscription = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        topic,
-        qos,
-        std::bind(&LidarToPointCloudNode::lidarCallback, this, std::placeholders::_1)
+  void addPoints(const std::vector<std::tuple<float, float, float>> &new_points) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (const auto &p : new_points) {
+      // Round to 3 decimals to reduce memory (same as Python)
+      auto rounded = std::make_tuple(
+        std::round(std::get<0>(p) * 1000.0f) / 1000.0f,
+        std::round(std::get<1>(p) * 1000.0f) / 1000.0f,
+        std::round(std::get<2>(p) * 1000.0f) / 1000.0f
       );
-      subscriptions_.push_back(subscription);
-    }
-  }
-}
-
-void LidarToPointCloudNode::setupPublishers()
-{
-  auto qos = rclcpp::QoS(1)
-    .reliability(rclcpp::ReliabilityPolicy::BestEffort)
-    .history(rclcpp::HistoryPolicy::KeepLast);
-  
-  pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-    "/pointcloud/aggregated", qos
-  );
-}
-
-void LidarToPointCloudNode::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
-{
-  try {
-    // Convert ROS message to PCL point cloud
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromROSMsg(*msg, *cloud);
-    
-    // Extract points
-    std::vector<Point3D> points;
-    points.reserve(cloud->points.size());
-    
-    for (const auto& pcl_point : cloud->points) {
-      if (std::isfinite(pcl_point.x) && std::isfinite(pcl_point.y) && std::isfinite(pcl_point.z)) {
-        points.emplace_back(pcl_point.x, pcl_point.y, pcl_point.z);
+      if (present_.find(rounded) == present_.end()) {
+        order_.push_back(rounded);
+        present_.insert(rounded);
       }
     }
-    
-    // Add to aggregator
-    aggregator_->addPoints(points);
-    
-    // Publish aggregated point cloud
-    publishAggregatedPointcloud(msg->header);
-    
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR(this->get_logger(), "Error processing LiDAR data: %s", e.what());
-  }
-}
 
-void LidarToPointCloudNode::publishAggregatedPointcloud(const std_msgs::msg::Header& header)
-{
-  try {
-    auto points = aggregator_->getPointsCopy();
-    if (points.empty()) {
-      return;
+    while (order_.size() > max_points_) {
+      const auto &oldest = order_.front();
+      present_.erase(oldest);
+      order_.pop_front();
     }
-    
-    // Create PCL point cloud
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    cloud->points.reserve(points.size());
-    
-    for (const auto& point : points) {
-      cloud->points.emplace_back(point.x, point.y, point.z);
+
+    points_changed_ = true;
+  }
+
+  std::vector<std::tuple<float, float, float>> getPointsCopy() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<std::tuple<float, float, float>> out;
+    out.reserve(order_.size());
+    for (const auto &p : order_) out.push_back(p);
+    return out;
+  }
+
+  bool hasChanges() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return points_changed_;
+  }
+
+  void markSaved() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    points_changed_ = false;
+  }
+
+  std::size_t pointCount() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return order_.size();
+  }
+
+private:
+  std::size_t max_points_;
+  mutable std::mutex mutex_;
+  std::deque<std::tuple<float,float,float>> order_;
+  std::unordered_set<std::tuple<float,float,float>, RoundedPointHash> present_;
+  bool points_changed_ {false};
+};
+
+class LidarToPointCloudNode : public rclcpp::Node {
+public:
+  LidarToPointCloudNode()
+  : rclcpp::Node("lidar_to_pointcloud")
+  {
+    // Declare parameters
+    this->declare_parameter<std::string>("map_name", "3d_map");
+    this->declare_parameter<std::string>("map_save", "true");
+    this->declare_parameter<double>("save_interval", 10.0);
+    this->declare_parameter<int64_t>("max_points", 1000000);
+    this->declare_parameter<double>("voxel_size", 0.01);
+
+    // Load configuration
+    map_name_ = this->get_parameter("map_name").as_string();
+    save_map_ = toLower(this->get_parameter("map_save").as_string()) == "true";
+    save_interval_ = this->get_parameter("save_interval").as_double();
+    max_points_ = static_cast<std::size_t>(this->get_parameter("max_points").as_int());
+    voxel_size_ = this->get_parameter("voxel_size").as_double();
+
+    aggregator_ = std::make_unique<PointCloudAggregator>(max_points_);
+
+    // QoS configuration
+    rclcpp::SensorDataQoS qos_profile;
+
+    // Subscriptions
+    {
+      auto sub = this->create_subscription<PointCloud2>(
+        "/utlidar/cloud_deskewed", qos_profile,
+        std::bind(&LidarToPointCloudNode::lidarCallback, this, std::placeholders::_1));
+      subscriptions_.push_back(sub);
     }
-    
-    cloud->width = cloud->points.size();
+
+    // Publisher
+    pointcloud_pub_ = this->create_publisher<PointCloud2>("/pointcloud/aggregated", qos_profile);
+
+    // Timer for saving
+    if (save_map_) {
+      save_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(save_interval_),
+        std::bind(&LidarToPointCloudNode::saveMapCallback, this));
+    }
+
+    // Log configuration
+    RCLCPP_INFO(this->get_logger(), "\xF0\x9F\x97\xBA\xEF\xB8\x8F  LiDAR Processor Configuration:");
+    RCLCPP_INFO(this->get_logger(), "   Map name: %s", map_name_.c_str());
+    RCLCPP_INFO(this->get_logger(), "   Save map: %s", save_map_ ? "true" : "false");
+    if (save_map_) {
+      RCLCPP_INFO(this->get_logger(), "   Save interval: %.2fs", save_interval_);
+      RCLCPP_INFO(this->get_logger(), "   Max points: %zu", max_points_);
+      RCLCPP_INFO(this->get_logger(), "   Voxel size: %.3fm", voxel_size_);
+    }
+  }
+
+private:
+  static std::string toLower(const std::string &s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c){ return std::tolower(c); });
+    return out;
+  }
+
+  
+
+  void lidarCallback(const PointCloud2::SharedPtr msg) {
+    try {
+      std::vector<std::tuple<float, float, float>> points;
+      // Iterate points (x,y,z)
+      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
+        float x = *iter_x;
+        float y = *iter_y;
+        float z = *iter_z;
+        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+          points.emplace_back(x, y, z);
+        }
+      }
+
+      aggregator_->addPoints(points);
+      publishAggregatedPointcloud(msg->header);
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Error processing LiDAR data: %s", e.what());
+    }
+  }
+
+  void publishAggregatedPointcloud(const std_msgs::msg::Header &header) {
+    try {
+      auto points = aggregator_->getPointsCopy();
+      if (points.empty()) return;
+
+      PointCloud2 cloud_msg;
+      cloud_msg.header = header;
+      cloud_msg.height = 1;
+      cloud_msg.width = static_cast<uint32_t>(points.size());
+      cloud_msg.is_dense = false;
+
+      sensor_msgs::PointCloud2Modifier modifier(cloud_msg);
+      modifier.setPointCloud2FieldsByString(1, "xyz");
+      modifier.resize(points.size());
+
+      sensor_msgs::PointCloud2Iterator<float> it_x(cloud_msg, "x");
+      sensor_msgs::PointCloud2Iterator<float> it_y(cloud_msg, "y");
+      sensor_msgs::PointCloud2Iterator<float> it_z(cloud_msg, "z");
+      for (const auto &p : points) {
+        *it_x = std::get<0>(p);
+        *it_y = std::get<1>(p);
+        *it_z = std::get<2>(p);
+        ++it_x; ++it_y; ++it_z;
+      }
+
+      pointcloud_pub_->publish(cloud_msg);
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Error publishing point cloud: %s", e.what());
+    }
+  }
+
+  // Build a PCL cloud from aggregated points
+  static pcl::PointCloud<pcl::PointXYZ>::Ptr toPclCloud(
+      const std::vector<std::tuple<float,float,float>> &points) {
+    auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    cloud->reserve(points.size());
+    for (const auto &p : points) {
+      cloud->emplace_back(std::get<0>(p), std::get<1>(p), std::get<2>(p));
+    }
+    cloud->width = static_cast<uint32_t>(cloud->size());
     cloud->height = 1;
-    cloud->is_dense = true;
-    
-    // Convert to ROS message
-    sensor_msgs::msg::PointCloud2 pointcloud_msg;
-    pcl::toROSMsg(*cloud, pointcloud_msg);
-    pointcloud_msg.header = header;
-    
-    pointcloud_pub_->publish(pointcloud_msg);
-    
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR(this->get_logger(), "Error publishing point cloud: %s", e.what());
+    cloud->is_dense = false;
+    return cloud;
   }
-}
 
-void LidarToPointCloudNode::saveMapCallback()
-{
-  try {
-    if (!aggregator_->hasChanges()) {
-      return;
+  void saveMapCallback() {
+    return;
+    try {
+      if (!aggregator_->hasChanges()) return;
+      auto points = aggregator_->getPointsCopy();
+      if (points.empty()) return;
+
+      auto cloud = toPclCloud(points);
+      pcl::PointCloud<pcl::PointXYZ> filtered;
+      if (voxel_size_ > 0.0) {
+        pcl::VoxelGrid<pcl::PointXYZ> vg;
+        vg.setInputCloud(cloud);
+        vg.setLeafSize(static_cast<float>(voxel_size_), static_cast<float>(voxel_size_), static_cast<float>(voxel_size_));
+        vg.filter(filtered);
+      } else {
+        filtered = *cloud;
+      }
+
+      std::string filename = map_name_ + ".ply";
+      if (pcl::io::savePLYFileASCII(filename, filtered) == 0) {
+        auto total = aggregator_->pointCount();
+        aggregator_->markSaved();
+        RCLCPP_INFO(this->get_logger(), "\xF0\x9F\x92\xBE Saved map: %s (%zu downsampled / %zu total points)",
+                    filename.c_str(), static_cast<size_t>(filtered.size()), total);
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "Failed to save map: %s", filename.c_str());
+      }
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Error saving map: %s", e.what());
     }
-    
-    auto points = aggregator_->getPointsCopy();
-    if (points.empty()) {
-      return;
-    }
-    
-    // Create PCL point cloud
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    cloud->points.reserve(points.size());
-    
-    for (const auto& point : points) {
-      cloud->points.emplace_back(point.x, point.y, point.z);
-    }
-    
-    cloud->width = cloud->points.size();
-    cloud->height = 1;
-    cloud->is_dense = true;
-    
-    // Apply voxel downsampling for saving
-    if (config_.voxel_size > 0) {
-      pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-      pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-      voxel_filter.setInputCloud(cloud);
-      voxel_filter.setLeafSize(config_.voxel_size, config_.voxel_size, config_.voxel_size);
-      voxel_filter.filter(*downsampled_cloud);
-      cloud = downsampled_cloud;
-    }
-    
-    // Save to file
-    std::string map_filename = config_.map_name + ".ply";
-    if (pcl::io::savePLYFileBinary(map_filename, *cloud) == 0) {
-      int point_count = static_cast<int>(cloud->points.size());
-      int total_points = aggregator_->getPointCount();
-      aggregator_->markSaved();
-      
-      RCLCPP_INFO(this->get_logger(),
-        "💾 Saved map: %s (%d downsampled / %d total points)",
-        map_filename.c_str(), point_count, total_points);
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Failed to save map: %s", map_filename.c_str());
-    }
-    
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR(this->get_logger(), "Error saving map: %s", e.what());
   }
-}
 
-void LidarToPointCloudNode::logConfiguration()
-{
-  RCLCPP_INFO(this->get_logger(), "🗺️  LiDAR Processor Configuration:");
-  
-  std::string robot_ips = "[";
-  for (size_t i = 0; i < config_.robot_ip_list.size(); ++i) {
-    robot_ips += config_.robot_ip_list[i];
-    if (i < config_.robot_ip_list.size() - 1) robot_ips += ", ";
-  }
-  robot_ips += "]";
-  
-  RCLCPP_INFO(this->get_logger(), "   Robot IPs: %s", robot_ips.c_str());
-  RCLCPP_INFO(this->get_logger(), "   Map name: %s", config_.map_name.c_str());
-  RCLCPP_INFO(this->get_logger(), "   Save map: %s", config_.save_map ? "true" : "false");
-  
-  if (config_.save_map) {
-    RCLCPP_INFO(this->get_logger(), "   Save interval: %.1fs", config_.save_interval);
-    RCLCPP_INFO(this->get_logger(), "   Max points: %d", config_.max_points);
-    RCLCPP_INFO(this->get_logger(), "   Voxel size: %.3fm", config_.voxel_size);
-  }
-}
+private:
+  std::string map_name_ {"3d_map"};
+  bool save_map_ {true};
+  double save_interval_ {10.0};
+  std::size_t max_points_ {100000};
+  double voxel_size_ {0.01};
 
-}  // namespace lidar_processor_cpp
+  std::unique_ptr<PointCloudAggregator> aggregator_;
+  std::vector<rclcpp::Subscription<PointCloud2>::SharedPtr> subscriptions_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr pointcloud_pub_;
+  rclcpp::TimerBase::SharedPtr save_timer_;
+};
 
-int main(int argc, char* argv[])
-{
+int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
-  
   try {
-    auto node = std::make_shared<lidar_processor_cpp::LidarToPointCloudNode>();
+    auto node = std::make_shared<LidarToPointCloudNode>();
     rclcpp::spin(node);
-  } catch (const std::exception& e) {
-    std::cerr << "Error running lidar processor: " << e.what() << std::endl;
-    return 1;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "Error running lidar processor: %s\n", e.what());
   }
-  
   rclcpp::shutdown();
   return 0;
 }
+
+

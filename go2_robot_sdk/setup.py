@@ -37,6 +37,11 @@ setup(
     entry_points={
         'console_scripts': [
             'go2_driver_node = go2_robot_sdk.main:main',
+            'odom_tf_publisher = go2_robot_sdk.infrastructure.ros2.odom_tf_publisher:main',
+            'joint_states_publisher = go2_robot_sdk.infrastructure.ros2.joint_states_publisher:main',
+            'static_joint_states_publisher = go2_robot_sdk.infrastructure.ros2.static_joint_states_publisher:main',
+            'robot_driver_node = go2_robot_sdk.robot_driver_node:main',
+            'go2_status_bridge = go2_robot_sdk.go2_status_bridge:main',
         ],
     },
 )
